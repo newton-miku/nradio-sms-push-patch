@@ -1,0 +1,89 @@
+name: build
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Shell 语法体检（busybox 兼容性）
+        run: |
+          set -eu
+          fail=0
+          for f in install.sh usr/bin/*.sh tests/*.sh; do
+            [ -f "$f" ] || continue
+            printf '  %-46s' "$f"
+            if sh -n "$f" 2>/tmp/err; then echo "ok"; else echo "FAIL"; cat /tmp/err; fail=1; fi
+          done
+          exit $fail
+
+      - name: Python 语法体检
+        run: |
+          set -eu
+          for f in usr/bin/*.py tests/*.py; do
+            [ -f "$f" ] || continue
+            python3 -m py_compile "$f"
+            echo "  $f ok"
+          done
+          find . -name __pycache__ -type d -prune -exec rm -rf {} +
+
+      - name: 单元测试：短信标题提取
+        run: python3 tests/test_sms_title.py
+
+      - name: 单元测试：垃圾短信过滤
+        run: python3 tests/test_sms_filter.py
+
+      - name: 文件齐全性自检
+        run: |
+          set -eu
+          for f in install.sh \
+                   usr/bin/smstrun.py \
+                   usr/bin/smstrun.sh \
+                   usr/bin/smstrun-restart.sh \
+                   usr/bin/patch-modem-lua.py \
+                   README.md LICENSE; do
+            [ -s "$f" ] || { echo "缺失或为空: $f"; exit 1; }
+          done
+          grep -q 'AT+CMGL=4' usr/bin/smstrun.sh || { echo 'smstrun.sh 未用 AT+CMGL=4'; exit 1; }
+          grep -q "grep -v '\^'" usr/bin/smstrun.sh || { echo 'smstrun.sh 未过滤 URC'; exit 1; }
+          grep -q 'Reference number' usr/bin/smstrun.py || { echo 'smstrun.py 未合并长短信分段'; exit 1; }
+          grep -q 'saveapply' usr/bin/patch-modem-lua.py || { echo 'patch-modem-lua.py 未改 inputstyle'; exit 1; }
+          grep -q 'cell-sms-backup' install.sh || { echo 'install.sh 未做备份'; exit 1; }
+          echo '自检通过'
+
+      - name: 行尾必须是 LF
+        run: |
+          set -eu
+          bad=$(git ls-files -z | xargs -0 file | grep -i 'CRLF' || true)
+          if [ -n "$bad" ]; then echo "$bad"; exit 1; fi
+          echo '全部 LF'
+
+      - name: 打包
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          set -eu
+          mkdir -p out
+          tar -czf "out/openwrt-sms-patch-${GITHUB_REF_NAME}.tar.gz" \
+            install.sh README.md LICENSE usr tools
+          echo "artifact: out/openwrt-sms-patch-${GITHUB_REF_NAME}.tar.gz"
+
+      - uses: actions/upload-artifact@v4
+        if: startsWith(github.ref, 'refs/tags/v')
+        with:
+          name: openwrt-sms-patch-${{ github.ref_name }}
+          path: out/*.tar.gz
+
+      - uses: softprops/action-gh-release@v2
+        if: startsWith(github.ref, 'refs/tags/v')
+        with:
+          files: out/*.tar.gz
+          generate_release_notes: true

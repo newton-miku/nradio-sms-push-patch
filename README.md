@@ -1,37 +1,39 @@
-# 内置蜂窝 · 短信转发改推飞书
+# OpenWrt 内置蜂窝短信转发补丁
 
-把路由器「内置蜂窝」（`luci-app-WTModem`）的短信转发从 **PPS+（pushplus 公众号）** 换成 **飞书自定义机器人 webhook**，并在 LuCI 的「模组设定 → WEBUI 选项与转发」页里加一个输入框直接管它。
+把路由器「内置蜂窝」收到的短信实时转发到 **PushPlus（PPS+）** 或 **飞书自定义机器人 webhook**，替代固件原厂那条常年不通的转发链路，并在 LuCI 里给一个输入框直接管它。
 
-原链路完全不动，只是把 `smstrun.py` 换成**双后端**版本：配了飞书就推飞书，没配就照旧推 PPS+。
+- 适用：`luci-app-WTModem` 这类带内置蜂窝（4G/LTE Cat.1 模组）的 OpenWrt 设备，本仓库验证于鲲鹏系列设备的 ATSDK 固件。
+- 不依赖任何第三方 Python 包（只用标准库 `socket` / `subprocess` / `json` / `re`）。
+- 原链路不动：配了飞书走飞书，没配就照旧走 PushPlus。
 
-`smstrun.sh` 同样要换（原因见下面「原固件的三个 bug」），否则短信永远读不出来。
+> 本仓库是一个独立补丁，与任何线路/延迟监测项目无关。
 
 ---
 
-## 背景：PPS+ 到底是什么
+## 原厂转发链路
 
 固件里那个「PPS+平台转发Token」容易让人以为是本地 webhook，其实不是：
 
 - `luci-app-WTModem` 的 CBI 文件 `/usr/lib/lua/luci/model/cbi/modem.lua` 里定义的是
-  `wechat_webhook = section:taboption("WEBUI", Value, "wechat_webhook", "PPS+平台转发Token", "Token申请请微信搜索公众号“pushplus推送加”…")`。
-- 实际转发链路是 `/etc/init.d/modeminit` 拉起 `python3 /usr/bin/smstrun.py`，后者循环调用 `/usr/bin/smstrun.sh`（AT+CMGL 读短信 → PDU 解码 → 输出到 `/tmp/smstrunt.at`），发现新短信就 `requests.post("http://www.pushplus.plus/send", json={token, title, content})`。
+  `wechat_webhook = section:taboption("WEBUI", Value, "wechat_webhook", "PPS+平台转发Token", ...)`。
+- 实际链路是 `/etc/init.d/modeminit` 拉起 `python3 /usr/bin/smstrun.py`，后者循环调用 `/usr/bin/smstrun.sh`（AT+CMGL 读短信 → PDU 解码 → 输出到 `/tmp/smstrunt.at`），发现新短信就 POST 到 `http://www.pushplus.plus/send`。
 
 ---
 
-## 原固件的三个 bug
+## 原厂的三个 bug
 
-前两个会让链路**完全不通**，第三个是本次一并修好的体验问题。
+前两个会让链路**完全不通**，第三个是一并修好的体验问题。
 
 ### ① 短信读不出来（致命）
 
-原厂 `smstrun.sh` 用 `AT+CMGL=0`，只列**未读**短信。但本模组（`+CNMI: 2,1,0,2,0`，`+CPMS: "ME",11,300`）收到短信落进 ME 之后**立刻就是 `REC READ` 状态**，于是 `AT+CMGL=0` 恒空，`smstrun.py` 里的 `if "发件人" in out:` 永远不成立。实测：
+原厂 `smstrun.sh` 用 `AT+CMGL=0`，只列**未读**短信。但这类模组（`+CNMI: 2,1,0,2,0`，`+CPMS: "ME",11,300`）收到短信落进 ME 之后**立刻就是 `REC READ` 状态**，于是 `AT+CMGL=0` 恒空，`smstrun.py` 里的 `if "发件人" in out:` 永远不成立。实测：
 
 ```
 sendat 1 AT+CMGL=0   →  6 字节（只有 OK）
 sendat 1 AT+CMGL=4   →  3741 字节，8 条短信，stat 全为 1（REC READ）
 ```
 
-表现为 `/tmp/smstrun.log` 刷满「未检测到新消息，继续检测...」而飞书一条都收不到。
+表现为 `/tmp/smstrun.log` 刷满「未检测到新消息，继续检测...」而推送一条都收不到。
 
 新版改用 `AT+CMGL=4`，并做两件事：滤掉混在应答里的 `^PDCPDATAINFO` 之类 URC（`grep -v '^\^'`）；用「发件人 + 发件时间」做指纹记在 `/etc/smstrun-seen.conf`，只输出没推过的（**持久路径**，放 `/tmp` 的话每次重启都要重推全部存量短信）。
 
@@ -39,7 +41,7 @@ sendat 1 AT+CMGL=4   →  3741 字节，8 条短信，stat 全为 1（REC READ�
 
 ### ② uci 里的 token 没人写进去
 
-全固件没有任何代码把 uci 的 `wechat_webhook` 写进 `/usr/bin/smstrun.conf`，而 `smstrun.py` 启动时读不到该文件就直接打印「未找到配置文件，程序已退出！」并退出。所以这台路由器的短信转发**其实一直是断的**。本次一并修好。
+全固件没有任何代码把 uci 的 `wechat_webhook` 写进 `/usr/bin/smstrun.conf`，而 `smstrun.py` 启动时读不到该文件就直接打印「未找到配置文件，程序已退出！」并退出。所以原厂的短信转发**其实一直是断的**。本补丁一并修好：`patch-modem-lua.py` 给 CBI 加输入框，write 回调把值落盘。
 
 ### ③ 长短信被拆成碎片推送
 
@@ -52,28 +54,48 @@ sendat 1 AT+CMGL=4   →  3741 字节，8 条短信，stat 全为 1（REC READ�
 发件人:106589666300
 发件时间:10/03/26 17:31:56
 （长短信 3 段已完整拼接）
-【中国移动】100MB流量日包已到账，MB（编号：25JT206613），资费0元即生效，24小时后自动失效。
+【XX运营商】100MB流量日包已到账，MB（编号：25JT206613），资费0元即生效，24小时后自动失效。
 ```
 
 跨轮次攒段：3 段短信可能分两次采集才到齐，没齐就继续等（`/tmp/smstrun.log` 会打印「长短信分段未齐：发件人… 已收到 2/3 段，继续等待。」）。攒不齐的（比如模组已把更早的段清掉）超过 30 分钟就按现有内容推出，文案会标「只收到 2 段」，不会一直卡着不发。
+
+短信签名（`【XX运营商】` 这类前缀）几乎都贴在正文最前面，`smstrun.py` 会自动把它剥出来做标题后缀，避免标题过长。
+
+---
+
+## 文件
+
+| 文件 | 作用 |
+| --- | --- |
+| `install.sh` | 一键安装，幂等 |
+| `usr/bin/smstrun.py` | 主进程：读 `/tmp/smstrunt.at`、解码、合并分段、推送、DNS 兜底 |
+| `usr/bin/smstrun.sh` | 原厂 `smstrun.sh` 的修复版（`AT+CMGL=4` + URC 过滤） |
+| `usr/bin/smstrun-restart.sh` | 手工重启转发器 |
+| `usr/bin/patch-modem-lua.py` | patch `modem.lua`，加输入框并让表单真正保存 |
+| `tests/` | 单元测试与真机验证脚本 |
+| `tools/check-inline-js.sh` 等 | CI 自检 |
 
 ---
 
 ## 安装
 
 ```sh
-tar -cf lmcell.tar deploy-cell
-scp lmcell.tar root@192.168.66.1:/tmp/
-ssh root@192.168.66.1 "rm -rf /tmp/lmc && mkdir -p /tmp/lmc && tar -xf /tmp/lmcell.tar -C /tmp/lmc && \
-  FEISHU_URL='https://open.feishu.cn/open-apis/bot/v2/hook/你的hook id' sh /tmp/lmc/deploy-cell/install.sh"
-```
+# 1. 打包（仓库根目录）
+tar -cf lmsms.tar .
 
-不带 `FEISHU_URL` 也可以装，之后再从 LuCI 界面填。
+# 2. 上传到路由器
+scp lmsms.tar root@192.168.1.1:/tmp/
+
+# 3. 安装并填地址（不带 FEISHU_URL 也可以装，之后从 LuCI 界面填）
+ssh root@192.168.1.1 "rm -rf /tmp/lmsms && mkdir -p /tmp/lmsms && \
+  tar -xf /tmp/lmsms.tar -C /tmp/lmsms && \
+  FEISHU_URL='https://open.feishu.cn/open-apis/bot/v2/hook/YOUR_HOOK_ID' sh /tmp/lmsms/install.sh"
+```
 
 install.sh 会做四件事：
 
 1. 备份 `/usr/bin/smstrun.py`、`/usr/bin/smstrun.sh`、`/etc/init.d/modeminit`、`/usr/lib/lua/luci/model/cbi/modem.lua` 到 `/root/cell-sms-backup/`（**只在备份不存在时备份**，避免二次安装把已 patch 的版本当原件覆盖）。
-2. 装新版 `smstrun.py`（双后端 + 合并分段）、`smstrun.sh`（修读取）、`smstrun-restart.sh`、`patch-modem-lua.py`。
+2. 装新版 `smstrun.py`、`smstrun.sh`、`smstrun-restart.sh`、`patch-modem-lua.py`。
 3. 跑 `patch-modem-lua.py` 给 CBI 加输入框，然后 `/etc/init.d/uhttpd restart`。
 4. 杀掉旧的 `smstrun.py`、清 `/tmp/smstrun.lock`、重新 `nohup` 拉起。
 
@@ -88,7 +110,7 @@ install.sh 会做四件事：
 | 字段 | 作用 |
 | --- | --- |
 | `PPS+平台转发Token` | 老的 pushplus token。填了就写 `/usr/bin/smstrun.conf`。 |
-| `飞书 Webhook` | 飞书群机器人的完整地址。填了就写 `/usr/bin/smstrun-feishu.conf`，**转发走飞书**。留空则继续走 PPS+。 |
+| `飞书 Webhook` | 飞书群机器人的完整地址。填了就写 `/usr/bin/smstrun-feishu.conf`，**转发走飞书**。留空则继续走 PushPlus。 |
 
 填完点最下面的「应用通知与WebSocket配置」（这个按钮原本是 `inputstyle="apply"`，patch 时改成了 `saveapply`，否则表单值根本不会提交给 write 回调）。
 
@@ -98,7 +120,7 @@ install.sh 会做四件事：
 
 ```sh
 # 只换地址
-printf '%s' 'https://open.feishu.cn/open-apis/bot/v2/hook/xxxx' > /usr/bin/smstrun-feishu.conf
+printf '%s' 'https://open.feishu.cn/open-apis/bot/v2/hook/YOUR_HOOK_ID' > /usr/bin/smstrun-feishu.conf
 chmod 600 /usr/bin/smstrun-feishu.conf
 sh /usr/bin/smstrun-restart.sh
 
@@ -110,15 +132,17 @@ tail -f /tmp/smstrun.log
 改完记得同步 uci，否则 LuCI 界面下次打开会显示旧值：
 
 ```sh
-uci set modem.@ndis[0].feishu_webhook='https://open.feishu.cn/open-apis/bot/v2/hook/xxxx'
+uci set modem.@ndis[0].feishu_webhook='https://open.feishu.cn/open-apis/bot/v2/hook/YOUR_HOOK_ID'
 uci commit modem
 ```
+
+标题可在 `/usr/bin/smstrun-title.conf` 里改（默认 `未设置转发标题,新信息:`）。
 
 ---
 
 ## 消息格式
 
-飞书用的是 **post（富文本）** 消息，标题固定为短信转发标题（默认 `未设置转发标题,新信息:`，可用 `/usr/bin/smstrun-title.conf` 改），正文是解码后的短信全文：
+飞书用的是 **post（富文本）** 消息，标题取自 `/usr/bin/smstrun-title.conf` 加上短信签名，正文是解码后的短信全文：
 
 ```json
 {"msg_type":"post","content":{"post":{"zh_cn":{"title":"…","content":[[{"tag":"text","text":"发件人:…\n发件时间:…\n…"}]]}}}}
@@ -130,7 +154,7 @@ uci commit modem
 
 ## DNS 兜底（为什么需要）
 
-这台路由器的 `/etc/resolv.conf` 被 **tailscale MagicDNS** 接管：
+装了 MagicDNS 类客户端（比如 Tailscale）的设备上，`/etc/resolv.conf` 常被接管：
 
 ```
 # resolv.conf(5) file generated by tailscale
@@ -139,9 +163,9 @@ nameserver 100.100.100.100
 search <tailnet>.ts.net <你的搜索域>
 ```
 
-`100.100.100.100` 在本机不可达（`nslookup open.feishu.cn 100.100.100.100` → `connection timed out`），于是路由器**解析不了任何域名**——`ping 223.5.5.5` 通、`ip route` 默认路由正常，但 `curl https://www.baidu.com` 报 `curl: (6) Could not resolve host`。
+那个 MagicDNS 地址在部分网络下不可达，于是路由器**解析不了任何域名**——`ping 223.5.5.5` 通、默认路由正常，但 `curl https://example.com` 报 `Could not resolve host`。
 
-**不碰用户的 tailscale 配置**，改为在出网前兜底：
+**不碰用户的 VPN 配置**，改为在出网前兜底：
 
 1. `ensure_hosts_entry()` 先 `clean_hosts_entry()`（清掉自己上次写的行），再试 `socket.getaddrinfo('open.feishu.cn', 443, AF_INET)`；
 2. 解析失败就依次问 `127.0.0.1`（本地 dnsmasq）→ `223.5.5.5` → `114.114.114.114`，取第一个 IPv4 写进 `/etc/hosts`，行尾带标记 `# smstrun-feishu`；
@@ -175,12 +199,20 @@ sh /usr/bin/smstrun-restart.sh
 1. **`inputstyle="apply"` 不保存表单**。原来「应用通知与WebSocket配置」是 `apply`，填的值只存在于浏览器，write 回调里读不到。改成 `saveapply`。
 2. **uhttpd 缓存 CBI model**。改完 `/usr/lib/lua/luci/model/cbi/modem.lua` 必须 `/etc/init.d/uhttpd restart`，否则点按钮时跑的还是内存里的旧版本。
 3. **write 回调里不要引用 option 变量**。写 `wechat_webhook:formvalue(section)` 会白屏报 `attempt to index local 'wechat_webhook' (a nil value)`，因为 write 阶段这些变量还没绑上。只用 `self.map:get(section, …)`。
-4. **这台固件没有 `pkill`**。`pkill -f smstrun.py` 静默失败（rc=127），进程会一路堆积（一度 3 个）。必须用 `for p in $(ps w | grep '[s]mstrun.py' | awk '{print $1}'); do kill "$p"; done`。
+4. **这类固件往往没有 `pkill`**。`pkill -f smstrun.py` 静默失败（rc=127），进程会一路堆积（一度 3 个）。必须用 `for p in $(ps w | grep '[s]mstrun.py' | awk '{print $1}'); do kill "$p"; done`。
 5. **hosts 兜底条目要先清后试**，理由见上一节。
 6. **备份不能无条件覆盖**，否则第二次安装会把「已 patch 的 modem.lua」当成原件存进备份。
 7. **后台启动一律带重定向**。`os.execute("nohup python3 /usr/bin/smstrun.py >/tmp/smstrun.log 2>&1 &")` 里那段重定向不能省——`os.execute` 是同步等待的，子进程持有 stdout 管道会让 Lua 侧悬住。
-8. **`pdu_decoder` 读到换行才返回**。原厂脚本用 `echo "${pdu}" | pdu_decoder`（带换行）所以正常；写成 `printf '%s' "$line" | pdu_decoder` 会让整个脚本永久卡在 `read` 上（`ps` 里能同时看到 3 个 `sh /usr/bin/smstrun.sh` 加一个处于 R 状态的 `pdu_decoder`）。一定要用 `echo`。
+8. **`pdu_decoder` 读到换行才返回**。原厂脚本用 `echo "${pdu}" | pdu_decoder`（带换行）所以正常；写成 `printf '%s' "$line" | pdu_decoder` 会让整个脚本永久卡在 `read` 上。一定要用 `echo`。
 9. **`subprocess.run` 必须加 timeout**。`smstrun.sh` 里有 `sendat` 和 `pdu_decoder`，两者都可能卡住；不设上限的话 Python 那层的 `while True` 会永久阻塞、再也收不到短信。现在是 45 秒。
 10. **stdout 全缓冲让日志长期为空**。`nohup python3 foo.py` 的 stdout 是块缓冲的，`print` 的内容要攒满 4~8 KB 才落盘，于是 `/tmp/smstrun.log` 长时间空白、攒段过程完全不可观测。开头加 `sys.stdout.reconfigure(line_buffering=True)`（Python 3.7+；3.6 用 `PYTHONUNBUFFERED=1`）。
 11. **合并逻辑放在 Python 侧，别在 shell 里做**。分段 SMS 的 `Reference number` / `SMS segment N of M` 解析、跨轮次攒段、超时兜底，这些在 awk 里要写一大摊；`smstrun.py` 那边 `splitlines()` + 正则几行就完了。
 12. **「还没拼齐」必须返回空串**。`smstrun.py` 靠 `"发件人" in out` 判断要不要推送，合并函数如果没攒齐就把原始碎片回传，等于把半截消息又推出去了——这正是要修的问题本身。
+13. **首条 PDU 不能丢**。新进程起来时 AT 应答缓冲里可能已经躺着第一条短信，去重指纹要等它完整解码后才落盘，否则首条永远推不出去。
+14. **去重指纹要带上分段号**。指纹只用「发件人 + 发件时间」的话，长短信的第 2、3 段会被当成新短信反复推送；`smstrun.sh` 里要把 `Reference number` 与段号一起并进指纹。
+
+---
+
+## License
+
+MIT

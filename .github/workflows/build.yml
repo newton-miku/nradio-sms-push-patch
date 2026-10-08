@@ -53,11 +53,13 @@ jobs:
                    README.md LICENSE; do
             [ -s "$f" ] || { echo "缺失或为空: $f"; exit 1; }
           done
-          grep -q 'AT+CMGL=4' usr/bin/smstrun.sh || { echo 'smstrun.sh 未用 AT+CMGL=4'; exit 1; }
-          grep -q "grep -v '\^'" usr/bin/smstrun.sh || { echo 'smstrun.sh 未过滤 URC'; exit 1; }
-          grep -q 'Reference number' usr/bin/smstrun.py || { echo 'smstrun.py 未合并长短信分段'; exit 1; }
-          grep -q 'saveapply' usr/bin/patch-modem-lua.py || { echo 'patch-modem-lua.py 未改 inputstyle'; exit 1; }
-          grep -q 'cell-sms-backup' install.sh || { echo 'install.sh 未做备份'; exit 1; }
+          grep -Fq 'AT+CMGL=4' usr/bin/smstrun.sh || { echo 'smstrun.sh 未用 AT+CMGL=4'; exit 1; }
+          # 固定串匹配：URC 过滤是 `grep -v '^\^'`，模式串本身含反斜杠，
+          # 用 grep 的正则去匹配会被当成转义，必须 -F。
+          grep -Fq "grep -v '^\^'" usr/bin/smstrun.sh || { echo 'smstrun.sh 未过滤 URC'; exit 1; }
+          grep -Fq 'Reference number' usr/bin/smstrun.py || { echo 'smstrun.py 未合并长短信分段'; exit 1; }
+          grep -Fq 'saveapply' usr/bin/patch-modem-lua.py || { echo 'patch-modem-lua.py 未改 inputstyle'; exit 1; }
+          grep -Fq 'cell-sms-backup' install.sh || { echo 'install.sh 未做备份'; exit 1; }
           echo '自检通过'
 
       - name: 行尾必须是 LF

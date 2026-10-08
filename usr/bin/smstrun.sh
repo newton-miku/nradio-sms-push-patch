@@ -44,10 +44,37 @@ tmo() {
 # 测试注入点：设了 SMSTRUN_RAW_FILE 就直接读该文件的原始 AT 输出，便于在没有模组的
 # 机器上验证过滤与去重（tests/test_sms_order.sh 用它）。配合上面的 SEEN/OUT/TMP 覆盖，
 # 整个脚本可以完全跑在 /tmp 里，不碰真实状态。
+# 2026-10-07 自愈: 模组 USB 重连后 AT 端口可能漂移(ttyUSB1 被 cdc_ncm 抢走过)。
+# sendat 1 拿不到有效 CMGL 输出时, 探测其余 ttyUSB 口, 找到活口就更新
+# /dev/ttyUSB1 符号链接, 本轮立即用新端口重试。
+find_live_at() {
+    for t in /dev/ttyUSB*; do
+        [ -c "$t" ] || continue
+        n="${t##*/}"; n="${n#ttyUSB}"
+        [ "$n" = "1" ] && continue
+        out=$(tmo 4 sendat "$n" AT 2>/dev/null | tr -d '\r')
+        case "$out" in
+            *OK*) echo "$n"; return 0 ;;
+        esac
+    done
+    return 1
+}
+
 if [ -n "$SMSTRUN_RAW_FILE" ] && [ -f "$SMSTRUN_RAW_FILE" ]; then
     rec=$(tr -d '\r' < "$SMSTRUN_RAW_FILE" | grep -v '^\^')
 else
     rec=$(tmo 12 sendat 1 AT+CMGL=4 2>/dev/null | tr -d '\r' | grep -v '^\^')
+    case "$rec" in
+        *+CMGL:*) : ;;  # 端口正常
+        *)
+            live=$(find_live_at)
+            if [ -n "$live" ]; then
+                ln -sf "/dev/ttyUSB$live" /dev/ttyUSB1
+                logger -t smstrun "AT port drifted; remapped /dev/ttyUSB1 -> /dev/ttyUSB$live"
+                rec=$(tmo 12 sendat 1 AT+CMGL=4 2>/dev/null | tr -d '\r' | grep -v '^\^')
+            fi
+            ;;
+    esac
 fi
 
 : > "$TMP"

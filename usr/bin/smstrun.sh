@@ -60,6 +60,43 @@ find_live_at() {
     return 1
 }
 
+# 2026-10-16 存储管理:
+# 短信存 SIM(SM) 只有 50 槽, 满了就收不到新短信。每轮检查用量, 超 80%
+# 就按索引从小到大删 REC READ(已读) 短信, 降到 60% 为止。未读不碰,
+# 不影响未转发成功的短信。存储介质保持模组默认(SM), 不主动切换。
+ensure_storage() {
+    # 已指定测试输入时跳过, 不碰真实模组
+    [ -n "$SMSTRUN_RAW_FILE" ] && return 0
+
+    st=$(tmo 6 sendat 1 'AT+CPMS?' 2>/dev/null | tr -d '\r' | grep '^+CPMS:')
+    [ -n "$st" ] || return 0
+
+    # +CPMS: "SM",used,total,... 取第一组 used/total
+    used=$(printf '%s' "$st" | awk -F',' '{print $2}')
+    total=$(printf '%s' "$st" | awk -F',' '{print $3}')
+    case "$used" in ''|*[!0-9]*) return 0 ;; esac
+    case "$total" in ''|*[!0-9]*) return 0 ;; esac
+    [ "$total" -gt 0 ] 2>/dev/null || return 0
+
+    # 用量 >= 80% 时, 逐条删最旧的已读(CMGL=1 列 REC READ), 降到 60%
+    if [ $((used * 100 / total)) -ge 80 ]; then
+        logger -t smstrun "storage ${used}/${total} >= 80%, purging read SMS"
+        i=0
+        while [ $i -lt 64 ]; do
+            cur=$(tmo 6 sendat 1 'AT+CPMS?' 2>/dev/null | tr -d '\r' | grep '^+CPMS:' | awk -F',' '{print $2}')
+            case "$cur" in ''|*[!0-9]*) break ;; esac
+            [ $((cur * 100 / total)) -lt 60 ] && break
+            first_read=$(tmo 8 sendat 1 'AT+CMGL=1' 2>/dev/null | tr -d '\r' | sed -n 's/^+CMGL: \([0-9][0-9]*\),.*/\1/p' | head -n1)
+            [ -n "$first_read" ] || break
+            tmo 6 sendat 1 "AT+CMGD=$first_read" >/dev/null 2>&1
+            i=$((i + 1))
+        done
+        logger -t smstrun "purge done after $i deletions"
+    fi
+}
+
+ensure_storage
+
 if [ -n "$SMSTRUN_RAW_FILE" ] && [ -f "$SMSTRUN_RAW_FILE" ]; then
     rec=$(tr -d '\r' < "$SMSTRUN_RAW_FILE" | grep -v '^\^')
 else

@@ -1,0 +1,54 @@
+#!/bin/sh
+# 50-map-at: 固定将 3466:3301 模组的 AT 端口映射到 /dev/ttyUSB1
+#
+# 修订(2026-10-07): 模组 USB 重连后端口编号会漂移,且个别接口可能被
+# cdc_ncm 抢走(本次 iface01 丢失,AT 口漂到 ttyUSB2),旧逻辑"取第一个
+# VID/PID 匹配的 tty"会链错端口。改为: 收集该模组全部 tty,逐个发 AT
+# 探测,谁回 OK 就把谁链到 /dev/ttyUSB1。探测不到就按接口类 ff 且
+# 接口号最小者兜底。hotplug 事件可能来得比驱动绑定早,重试几轮。
+
+[ "$ACTION" = "add" ] || [ "$ACTION" = "bind" ] || exit 0
+
+TARGET_VID="3466"
+TARGET_PID="3301"
+
+VID="${PRODUCT%%/*}"
+PID="${PRODUCT#*/}"; PID="${PID%%/*}"
+[ "$VID" = "$TARGET_VID" ] && [ "$PID" = "$TARGET_PID" ] || exit 0
+
+(
+# 子 shell 后台跑,避免阻塞 hotplug 队列
+sleep 2
+
+find_at_port() {
+    # 输出第一个 AT 探测成功的 tty 名(不带 /dev/)
+    for t in /dev/ttyUSB*; do
+        [ -c "$t" ] || continue
+        name="${t##*/}"
+        grep -q "${TARGET_VID}/${TARGET_PID}" /sys/class/tty/$name/device/uevent 2>/dev/null || continue
+        # 发 AT,2 秒内收到 OK 才算数;URC 刷屏的端口没有 OK 会被跳过
+        if echo -e 'AT\r' > "$t" 2>/dev/null; then
+            resp=$(timeout 2 head -c 200 "$t" 2>/dev/null | tr -d '\r')
+            case "$resp" in
+                *OK*) echo "$name"; return 0 ;;
+            esac
+        fi
+    done
+    return 1
+}
+
+n=0
+while [ $n -lt 5 ]; do
+    port=$(find_at_port)
+    if [ -n "$port" ]; then
+        [ -e /dev/ttyUSB1 ] && [ "$(readlink /dev/ttyUSB1 2>/dev/null)" != "/dev/$port" ] && rm -f /dev/ttyUSB1
+        [ -e /dev/ttyUSB1 ] || ln -s "/dev/$port" /dev/ttyUSB1
+        logger -t map-at "Mapped /dev/$port to /dev/ttyUSB1 (AT probe OK)"
+        exit 0
+    fi
+    n=$((n + 1))
+    sleep 2
+done
+logger -t map-at "No AT-responsive port found after $n tries; ttyUSB1 left unchanged"
+) &
+exit 0
